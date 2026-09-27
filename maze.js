@@ -900,5 +900,9 @@
     return lines.join('\n');
   }
 
-  global.OMaze = { generate, validate, renderSvg, buildSheet, tapePlan, iofXml, colName, DEFAULTS, SHORT_RUN };
+  // Bump VERSION whenever a change alters what a given seed and settings generate,
+  // so share links made with an older version can say so.
+  const VERSION = 1;
+
+  global.OMaze = { generate, validate, renderSvg, buildSheet, tapePlan, iofXml, colName, DEFAULTS, SHORT_RUN, VERSION };
 })(typeof window !== 'undefined' ? window : globalThis);

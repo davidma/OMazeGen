@@ -20,10 +20,55 @@
 
   // ---- Settings -------------------------------------------------------------
   const get = k => ($(k).type === 'checkbox' ? $(k).checked : $(k).value);
+  // ---- Share links ------------------------------------------------------------
+  // A share link carries every setting and the course list (name, level, key and
+  // re-roll count) as base64url JSON in ?s=. Generation is deterministic, so that is
+  // enough to rebuild the exact maze, flags and courses. It also carries the generator
+  // version, because a later change to the generator would rebuild old links differently.
+  const toB64 = s => btoa(unescape(encodeURIComponent(s))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const fromB64 = s => decodeURIComponent(escape(atob(s.replace(/-/g, '+').replace(/_/g, '/'))));
+  function shareState() {
+    const f = {};
+    for (const k of FIELDS) f[k] = get(k);
+    return { v: OMaze.VERSION, f, c: courses.map(c => [c.name, +c.difficulty, c.key, c.variant || 0]) };
+  }
+  function shareUrl() {
+    const base = location.href.split(/[?#]/)[0];
+    return `${base}?s=${toB64(JSON.stringify(shareState()))}`;
+  }
+  function readShare(param) {
+    const d = JSON.parse(fromB64(param));
+    if (!d || typeof d.f !== 'object' || !Array.isArray(d.c) || !d.c.length) throw new Error('bad share data');
+    return {
+      version: d.v,
+      fields: d.f,
+      courses: d.c.map(([name, difficulty, key, variant], i) => ({
+        name: String(name || `Course ${i + 1}`), difficulty: +difficulty || 3, key: +key || i + 1, variant: +variant || 0,
+      })),
+    };
+  }
+  function notify(text) {
+    $('notice').textContent = text;
+    $('notice').hidden = !text;
+  }
+
   function load() {
     let saved = {};
     try { saved = JSON.parse(localStorage.getItem(STORE) || '{}'); } catch (e) {}
     const query = new URLSearchParams(location.search);
+    // A share link replaces the saved settings entirely.
+    if (query.has('s')) {
+      try {
+        const shared = readShare(query.get('s'));
+        saved = { ...shared.fields, courses: shared.courses };
+        notify(shared.version === OMaze.VERSION
+          ? 'Loaded the shared maze and courses. Your own settings were replaced; changes you make now are saved as usual.'
+          : 'This link was made with a different version of O-Maze Setter, so the maze and courses may not match what was shared. The settings were loaded as they were.');
+      } catch (e) {
+        notify("This share link is damaged or incomplete, so your own saved settings were loaded instead. Ask for the link again.");
+      }
+      history.replaceState(null, '', location.href.replace(/[?&]s=[^&#]*/, '').replace(/\?(#|$)/, '$1'));
+    }
     for (const k of FIELDS) {
       const v = query.has(k) ? query.get(k) : saved[k];
       if (v == null) continue;
@@ -423,6 +468,25 @@
     download(`${slug(s.event)}-courses.xml`, OMaze.iofXml(current, { event: s.event, spacing: s.spacing }), 'application/xml');
   });
 
+  $('share').addEventListener('click', async () => {
+    const url = shareUrl();
+    const status = $('export-status');
+    try {
+      await navigator.clipboard.writeText(url);
+      status.textContent = 'Share link copied. Anyone who opens it gets this exact maze and these courses.';
+    } catch (e) {
+      // Clipboard refused (some browsers, or a page opened from a file): show the link to copy by hand.
+      status.textContent = 'Copy this share link: ';
+      const box = document.createElement('input');
+      box.className = 'plain';
+      box.readOnly = true;
+      box.value = url;
+      box.setAttribute('aria-label', 'Share link');
+      status.appendChild(box);
+      box.select();
+    }
+  });
+
   // ---- Tabs and controls ---------------------------------------------------------
   const tabs = ['map', 'course', 'sheet'];
   function showTab(name) {
@@ -460,7 +524,9 @@
       try {
         const cp = await coursesPdf(current, s), mp = await masterPdf(current, s);
         const xml = OMaze.iofXml(current, { event: s.event, spacing: s.spacing });
-        $('export-status').textContent = `SELFTEST OK courses.pdf=${cp.output('arraybuffer').byteLength} master.pdf=${mp.output('arraybuffer').byteLength} xml=${xml.length}`;
+        const link = shareUrl(), back = readShare(new URL(link).searchParams.get("s"));
+        const roundTrip = JSON.stringify(back.fields) === JSON.stringify(shareState().f) && back.courses.length === courses.length;
+        $("export-status").textContent = `SELFTEST OK courses.pdf=${cp.output("arraybuffer").byteLength} master.pdf=${mp.output("arraybuffer").byteLength} xml=${xml.length} share=${roundTrip ? "ok" : "MISMATCH"} link=${link}`;
         if (query.has('dump')) {
           const pre = document.createElement('pre');
           pre.id = 'dump';

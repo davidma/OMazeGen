@@ -169,6 +169,7 @@
   .chip.yes { background: var(--accent-soft); color: var(--accent); }
   .chip.no { background: var(--field); color: var(--muted); }
 
+  .notice { margin: 0; padding: 10px 14px; border-radius: 8px; background: var(--accent-soft); color: var(--ink); font-size: 14px; }
   .problems { color: var(--danger); font-weight: 600; }
   .problems:empty { display: none; }
   .offscreen { position: absolute; left: -10000px; top: 0; width: 1px; height: 1px; overflow: hidden; }
@@ -280,6 +281,7 @@
     </aside>
 
     <main>
+      <p class="notice" id="notice" role="status" hidden></p>
       <div class="problems" id="problems" role="alert"></div>
 
       <section class="panel export" aria-label="Export">
@@ -291,6 +293,7 @@
           <button type="button" class="primary" id="export-courses">Course maps (PDF)</button>
           <button type="button" class="secondary" id="export-master">Master map (PDF)</button>
           <button type="button" class="secondary" id="export-xml">IOF XML</button>
+          <button type="button" class="secondary" id="share">Copy share link</button>
         </div>
         <p class="status" id="export-status" aria-live="polite">Course maps are one A4 page per course. The master map adds the setting-out instructions.</p>
       </section>
