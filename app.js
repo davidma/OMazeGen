@@ -210,8 +210,8 @@
       <div>
         <h3>Controls to hang</h3>
         <div class="runs-wrap"><table class="runs">
-          <thead><tr><th>Code</th><th>Beside post</th><th>Side of post</th><th>Use</th></tr></thead>
-          <tbody>${sheet.controls.map(c => `<tr><td>${c.code}</td><td class="list">${c.post}</td><td class="list">${c.side}</td><td>${esc(c.use)}</td></tr>`).join('')}</tbody>
+          <thead><tr><th>Code</th><th>Post</th><th>Side</th><th>Feature</th><th>Use</th></tr></thead>
+          <tbody>${sheet.controls.map(c => `<tr><td>${c.code}</td><td class="list">${c.post}</td><td class="list">${c.side}</td><td>${c.feature}</td><td>${esc(c.use)}</td></tr>`).join('')}</tbody>
         </table></div>
       </div>` : '';
     $('sheet').innerHTML = `
@@ -355,8 +355,8 @@
     doc.addPage('a4', 'portrait');
     const st = { y: pageHeader(doc, s.event, 'Setting out',
       `Start entrance ${sheet.start} · finish exit ${sheet.finish} · other openings ${sheet.gaps.join(', ') || 'none'}`) + 2 };
-    textTable(doc, st, 'Controls to hang', [{ head: 'Code', w: 16 }, { head: 'Beside post', w: 26 }, { head: 'Side', w: 14 }, { head: 'Use', w: 0 }],
-      sheet.controls.map(c => [c.code, c.post, c.side, c.use]));
+    textTable(doc, st, 'Controls to hang', [{ head: 'Code', w: 14 }, { head: 'Post', w: 16 }, { head: 'Side', w: 12 }, { head: 'Feature', w: 30 }, { head: 'Use', w: 0 }],
+      sheet.controls.map(c => [c.code, c.post, c.side, c.feature, c.use]));
     textTable(doc, st, 'Tape across, by row', [{ head: 'Row', w: 14 }, { head: 'Segments', w: 20 }, { head: 'Tape runs', w: 0 }],
       sheet.rows.map(g => [g.name, runTotal(g.runs), runList(g.runs)]));
     textTable(doc, st, 'Tape up, by column', [{ head: 'Col', w: 14 }, { head: 'Segments', w: 20 }, { head: 'Tape runs', w: 0 }],

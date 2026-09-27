@@ -226,6 +226,44 @@
     return d === -1 ? Infinity : d;
   }
 
+  // ---- Where flags hang --------------------------------------------------------
+  // A flag always hangs a quarter square from a post, at a feature of the tape there:
+  //   inside   in a corner between two tapes that meet at a right angle
+  //   outside  diagonally across an L-shaped corner (a post with exactly two tapes), outside it
+  //   tip      just past the end of a run of tape (a post with one tape), in line with it
+  //   beside   beside a straight run of tape, square to it, on a side with no tape
+  // Tips and beside spots sit on the open line between two squares; the flag is routed
+  // through the square to its east or south (west or north at the maze edge).
+  const KINDS = { inside: 'inside corner', outside: 'outside corner', tip: 'end of tape', beside: 'beside tape' };
+
+  function spotsAt(m, px, py) {
+    const { hw, vw } = m;
+    const cw = m.width - 1, ch = m.height - 1;
+    const N = !!(py > 0 && vw[py - 1][px]), S = !!(py < ch && vw[py][px]);
+    const Wa = !!(px > 0 && hw[py][px - 1]), E = !!(px < cw && hw[py][px]);
+    const arms = N + S + Wa + E;
+    const spots = [];
+    const add = (kind, dx, dy) => {
+      const pt = [px + 0.25 * dx, py + 0.25 * dy];
+      if (!(pt[0] > 0 && pt[0] < cw && pt[1] > 0 && pt[1] < ch)) return;
+      const x = dx < 0 ? px - 1 : dx > 0 ? px : px < cw ? px : px - 1;
+      const y = dy < 0 ? py - 1 : dy > 0 ? py : py < ch ? py : py - 1;
+      spots.push({ kind, post: [px, py], pt, dir: [dx, dy], x, y });
+    };
+    for (const [dx, dy] of [[1, -1], [-1, -1], [1, 1], [-1, 1]]) {
+      const v = dy < 0 ? N : S, h = dx < 0 ? Wa : E;
+      if (v && h) add('inside', dx, dy);
+      else if (arms === 2 && !v && !h && (dy < 0 ? S : N) && (dx < 0 ? E : Wa)) add('outside', dx, dy);
+    }
+    if (arms === 1) {
+      const [dx, dy] = N ? [0, 1] : S ? [0, -1] : Wa ? [1, 0] : [-1, 0];
+      add('tip', dx, dy);
+    }
+    if (Wa && E && !(N && S)) { if (!N) add('beside', 0, -1); if (!S) add('beside', 0, 1); }
+    if (N && S && !(Wa && E)) { if (!Wa) add('beside', -1, 0); if (!E) add('beside', 1, 0); }
+    return spots;
+  }
+
   // ---- Course setting --------------------------------------------------------
   // All courses share one set of hung controls. The hardest course is planned first
   // and places its controls; the usable controls it doesn't visit and the dummies are
@@ -238,9 +276,17 @@
   //                    where they look like they go; hard ones look close but aren't
   //   route choice     hard legs favour two routes of near-equal length
   //   dead ends        easy avoids controls in pockets, hard seeks them
-  // The hardest course's t also sets where flags hang (clear inside corners when easy,
-  // ambiguous posts when hard) and how near the dummies sit, and allows one trap.
+  //   features         easy favours inside corners and tape ends; hard favours outside
+  //                    corners; beside a straight run is the least used
+  // The hardest course's t also sets how near the dummies sit, and allows one trap.
   const levelT = level => (clamp(level | 0, 1, 5) - 1) / 4;
+  const KIND_PREF = {           // [level 1, level 5]
+    inside: [0.6, 0.3],
+    tip: [0.5, 0.3],
+    outside: [0.1, 0.5],
+    beside: [-0.3, 0],
+  };
+  const kindPref = (kind, t) => KIND_PREF[kind][0] * (1 - t) + KIND_PREF[kind][1] * t;
 
   function setCourses(m, rand) {
     const o = m.options;
@@ -256,16 +302,19 @@
     const pLevel = defs[primary].difficulty, tP = levelT(pLevel);
 
     const g = buildGraph(m);
-    const cells = [];
-    for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) cells.push({ x, y, id: g.id(x, y) });
-    const manh = (a, b) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]);
     const span = cw + ch;
     const fromStart = bfs(g, g.start).dist, toFinish = bfs(g, g.finish).dist;
-    const taken = new Set();
+
+    // Every place a flag could hang, with the square it is routed through.
+    const spots = [];
+    for (let py = 0; py <= ch; py++) for (let px = 0; px <= cw; px++) {
+      for (const s of spotsAt(m, px, py)) spots.push(Object.assign(s, { id: g.id(s.x, s.y), sid: spots.length }));
+    }
 
     // Map geometry in square units, for keeping the drawn course readable.
     const centre = id => { const [x, y] = g.pos(id); return [x + 0.5, y + 0.5]; };
     const finishPt = centre(g.finish);
+    const dist2 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
     // Penalty for a leg drawn from p to q: its line passing through another circle,
     // q sitting on one of the course's existing lines, or doubling back over the previous leg.
     const clutter = (lines, p, q, prev, others) => {
@@ -281,84 +330,42 @@
       return pen;
     };
 
-    // Controls hang beside a post, in one corner of their square. Corner [dx,dy] is the
-    // post at (x+dx, y+dy); the flag point sits a quarter square into the square from it.
-    const CORNERS = [[0, 0], [1, 0], [0, 1], [1, 1]];
-    const { hw, vw } = m;
-    const postDegree = (x, y) =>
-      (x > 0 && hw[y][x - 1] ? 1 : 0) + (x < cw && hw[y][x] ? 1 : 0) +
-      (y > 0 && vw[y - 1][x] ? 1 : 0) + (y < ch && vw[y][x] ? 1 : 0);
-    const flagAt = (c, [dx, dy]) => ({
-      post: [c.x + dx, c.y + dy],
-      pt: [c.x + dx + (dx ? -0.25 : 0.25), c.y + dy + (dy ? -0.25 : 0.25)],
-    });
-    // Tapes of this square that meet at the corner: 2 = an inside corner.
-    const cornerTapes = (c, [dx, dy]) => (hw[c.y + dy][c.x] ? 1 : 0) + (vw[c.y][c.x + dx] ? 1 : 0);
     // Spacing: one flag per post, and every flag at least a square from every other.
     // The trap pair is the only exception (placed deliberately, closer than that).
     const usedPosts = new Set();
     const flags = [];
-    const clearOf = pt => flags.every(q => Math.hypot(q[0] - pt[0], q[1] - pt[1]) >= 1);
-    const canHang = c => CORNERS.some(k => {
-      const f = flagAt(c, k);
-      return !usedPosts.has(f.post.join()) && clearOf(f.pt);
-    });
+    const clearOf = pt => flags.every(q => dist2(q, pt) >= 1);
+    const nearEnds = s => fromStart[s.id] < 2 || toFinish[s.id] < 2;
+    const canUse = s => !usedPosts.has(s.post.join()) && clearOf(s.pt) && !nearEnds(s);
+    const hang = s => { usedPosts.add(s.post.join()); flags.push(s.pt); };
 
-    // The trap: at a tape corner (a post with exactly two tapes, at right angles), the
-    // square inside the L and the square diagonally opposite, outside it. One flag goes
-    // in each, both hard against the post: a course control and a dummy, side by side,
-    // only one correct. At most one in the maze, only when the hardest course is level
-    // 3-5 (chance 1/2, 3/4, always); courses below level 3 never use its control.
+    // The trap: at a tape corner (a post with exactly two tapes, at right angles), a
+    // course control on one side of the corner and a dummy on the other, both hard
+    // against the post: side by side, only one correct. At most one in the maze, only
+    // when the hardest course is level 3-5 (chance 1/2, 3/4, always); courses below
+    // level 3 never use its control.
     let traps = dummies > 0 && rand() < [0, 0, 0.5, 0.75, 1][pLevel - 1] ? 1 : 0;
-    // Square across the corner from square (x,y) at post [px,py], or null if not a trap spot.
-    const trapPartner = (x, y, [px, py]) => {
-      const n = py > 0 && vw[py - 1][px], s = py < ch && vw[py][px];
-      const w = px > 0 && hw[py][px - 1], e = px < cw && hw[py][px];
-      if (n + s + w + e !== 2 || !(n || s) || !(w || e)) return null;
-      const inside = [w ? px - 1 : px, n ? py - 1 : py];
-      const outside = [2 * px - 1 - inside[0], 2 * py - 1 - inside[1]];
-      const inMaze = ([a, b]) => a >= 0 && a < cw && b >= 0 && b < ch;
-      if (!inMaze(inside) || !inMaze(outside)) return null;
-      if (x === inside[0] && y === inside[1]) return outside;
-      if (x === outside[0] && y === outside[1]) return inside;
-      return null;
-    };
-    const partnerFree = c => {
-      const p = trapPartner(c.x, c.y, c.post);
-      return p && !taken.has(g.id(p[0], p[1])) ? p : null;
+    const partnerOf = s => (s.kind === 'inside' || s.kind === 'outside')
+      ? spots.find(q => q.post[0] === s.post[0] && q.post[1] === s.post[1] && q.dir[0] === -s.dir[0] && q.dir[1] === -s.dir[1] &&
+                        (q.kind === 'inside' || q.kind === 'outside') && q.kind !== s.kind) || null
+      : null;
+    const hungSids = new Set();
+    // The partner spot is free if nothing hangs there and it is a square from every
+    // flag except its own control.
+    const partnerFree = s => {
+      const p = partnerOf(s);
+      return p && !hungSids.has(p.sid) && flags.every(q => q === s.pt || dist2(q, p.pt) >= 1) ? p : null;
     };
 
-    // Easy settings favour clear inside corners. Hard ones favour posts where tape
-    // carries on beyond the corner, so the neighbouring squares look alike. While a
-    // trap is wanted and no control on the route offers one yet, tape corners get a boost.
-    const chooseCorner = (c, route, penalty = () => 0) => {
-      const wantTrap = traps && !route.some(partnerFree);
-      for (const strict of [true, false]) {
-        let best = null, bestScore = -Infinity;
-        for (const k of CORNERS) {
-          const f = flagAt(c, k);
-          if (usedPosts.has(f.post.join()) || (strict && !clearOf(f.pt))) continue;
-          const inside = cornerTapes(c, k);
-          const beyond = postDegree(f.post[0], f.post[1]) - inside;
-          let s = (1 - tP) * inside / 2 + tP * ((inside ? 0.5 : 0) + Math.min(beyond, 2) / 4) + rand() * 0.3 - penalty(f.pt);
-          const p = wantTrap && trapPartner(c.x, c.y, f.post);
-          if (p && !taken.has(g.id(p[0], p[1]))) s += 0.6;
-          if (s > bestScore) { bestScore = s; best = f; }
-        }
-        if (best) return best;
-      }
-      return flagAt(c, CORNERS[0]);
-    };
-
-    // Plan one course of n controls at difficulty t. With no pool it places new flags
-    // in free squares; with a pool it picks from flags already hung.
+    // Plan one course of n controls at difficulty t. With no pool it hangs new flags
+    // at free spots; with a pool it picks from flags already hung.
     function planRoute(t, n, pool) {
       const lo = Math.max(2, Math.round(span * (0.25 + 0.2 * t)));
       const hi = Math.max(lo + 2, Math.round(span * (0.55 + 0.75 * t)));
-      const route = [], lines = [], chosen = new Set();
-      const source = pool || cells;
-      const free = pool ? c => !chosen.has(c.id) : c => !taken.has(c.id);
-      const ok = pool ? free : c => free(c) && fromStart[c.id] >= 2 && toFinish[c.id] >= 2 && canHang(c);
+      const route = [], lines = [], chosen = new Set(), chosenCells = new Set();
+      const source = pool || spots;
+      const ok = pool ? s => !chosen.has(s.sid) : canUse;
+      const fallback = pool ? ok : s => !usedPosts.has(s.post.join()) && clearOf(s.pt);
       let cur = g.start, prevPt = null;
       for (let i = 0; i < n; i++) {
         const base = bfs(g, cur);
@@ -366,38 +373,34 @@
         const curPt = i === 0 ? centre(cur) : route[i - 1].pt;
         const placedPts = route.map(c => c.pt);
         const others = placedPts.slice(0, -1);
+        const wantTrap = !pool && traps && !route.some(partnerFree);
         let cand = [];
         for (const [a, b] of [[lo, hi], [Math.ceil(lo / 2), hi * 2], [1, Infinity]]) {
-          cand = source.filter(c => ok(c) && base.dist[c.id] >= a && base.dist[c.id] <= b);
+          cand = source.filter(s => ok(s) && base.dist[s.id] >= a && base.dist[s.id] <= b);
           if (cand.length) break;
         }
-        if (!cand.length) cand = source.filter(free);
+        if (!cand.length) cand = source.filter(fallback);
         if (!cand.length) break;
         let best = null, bestScore = -Infinity;
         for (const c of shuffle(cand, rand).slice(0, 40)) {
-          const d = base.dist[c.id];
-          const deception = clamp((d / Math.max(1, manh(here, [c.x, c.y])) - 1) / 2, 0, 1);
+          const d = Math.max(1, base.dist[c.id]);
+          const deception = clamp((d / Math.max(1, Math.abs(here[0] - c.x) + Math.abs(here[1] - c.y)) - 1) / 2, 0, 1);
           const ratio = alternative(g, cur, c.id, base) / d;
           const choice = ratio <= 1.15 ? 1 : ratio < 1.6 ? (1.6 - ratio) / 0.45 : 0;
           const deadEnd = g.adj[c.id].length === 1 ? 1 : 0;
-          let s = (-0.6 + 1.6 * t) * deception + (0.2 + 0.6 * t) * choice + (-0.4 + 0.9 * t) * deadEnd;
-          if (pathTo(base.prev, c.id).slice(1, -1).some(v => chosen.has(v))) s -= 0.8; // runs through another control
-          if (i === n - 1 && toFinish[c.id] < lo / 2) s -= 0.6;                       // last control too near finish
-          const q = pool ? c.pt : centre(c.id);
-          s -= clutter(lines, curPt, q, prevPt, others);
-          if (i === n - 1) s -= clutter(lines, q, finishPt, curPt, placedPts);         // closing leg to the finish
+          let s = (-0.6 + 1.6 * t) * deception + (0.2 + 0.6 * t) * choice + (-0.4 + 0.9 * t) * deadEnd + kindPref(c.kind, t);
+          if (pathTo(base.prev, c.id).slice(1, -1).some(v => chosenCells.has(v))) s -= 0.8; // runs through another control
+          if (i === n - 1 && toFinish[c.id] < lo / 2) s -= 0.6;                             // last control too near finish
+          s -= clutter(lines, curPt, c.pt, prevPt, others);
+          if (i === n - 1) s -= clutter(lines, c.pt, finishPt, curPt, placedPts);            // closing leg to the finish
+          if (wantTrap && partnerFree(c)) s += 0.6;
           s += rand() * 0.4;
           if (s > bestScore) { bestScore = s; best = c; }
         }
-        if (!pool) {
-          Object.assign(best, chooseCorner(best, route, pt =>
-            clutter(lines, curPt, pt, prevPt, others) + (i === n - 1 ? clutter(lines, pt, finishPt, curPt, placedPts) : 0)));
-          usedPosts.add(best.post.join());
-          flags.push(best.pt);
-          taken.add(best.id);
-        }
+        if (!pool) { hang(best); hungSids.add(best.sid); }
         route.push(best);
-        chosen.add(best.id);
+        chosen.add(best.sid);
+        chosenCells.add(best.id);
         lines.push([...curPt, ...best.pt]);
         prevPt = curPt;
         cur = best.id;
@@ -405,109 +408,92 @@
       return { route, lines };
     }
 
-    // Best free square by score(c, strict); score returns null to reject. Spacing
-    // rules apply on a strict first pass, then are dropped if the maze is too cramped.
+    // Best spot by score(s, strict); score returns null to reject. Spacing rules apply
+    // on a strict first pass; if the maze is cramped the second pass lets flags sit
+    // nearer the start and finish, but never breaks the spacing rules.
     const pick = score => {
       for (const strict of [true, false]) {
         let best = null, bestScore = -Infinity;
-        for (const c of cells) {
-          if (taken.has(c.id) || (strict && (fromStart[c.id] < 2 || toFinish[c.id] < 2))) continue;
-          const s = score(c, strict);
-          if (s !== null && s > bestScore) { bestScore = s; best = c; }
+        for (const s of spots) {
+          if (strict ? !canUse(s) : usedPosts.has(s.post.join()) || !clearOf(s.pt)) continue;
+          const v = score(s, strict);
+          if (v !== null && v > bestScore) { bestScore = v; best = s; }
         }
         if (best) return best;
       }
       return null;
     };
 
-    // 1. The hardest course places its controls.
+    // 1. The hardest course hangs its controls.
     const main = planRoute(tP, sizeFor(pLevel), null);
 
     // 2. The trap dummy, across the tape corner from one of those controls.
-    const dummyCells = [];
+    const dummySpots = [];
     let trapControl = null;
     if (traps) {
       const offers = main.route.filter(partnerFree);
       if (offers.length) {
         const c = offers[Math.floor(rand() * offers.length)];
-        const [dx, dy] = partnerFree(c);
-        const cell = cells.find(q => q.x === dx && q.y === dy);
-        Object.assign(cell, flagAt(cell, [c.post[0] - dx, c.post[1] - dy]), { trap: true });
-        flags.push(cell.pt);
-        dummyCells.push(cell);
-        taken.add(cell.id);
-        trapControl = c.id;
+        const d = partnerFree(c);
+        d.trap = true;
+        flags.push(d.pt);
+        hungSids.add(d.sid);
+        dummySpots.push(d);
+        trapControl = c.sid;
       }
     }
 
     // 3. Usable controls the hardest course doesn't visit are still hung, for the
     //    other courses. Spread them out, clear of the hardest course's lines.
-    const spareCells = [];
-    while (main.route.length + spareCells.length < usable) {
-      const best = pick((c, strict) => {
-        if (strict && !canHang(c)) return null;
-        const gap = flags.length ? Math.min(...flags.map(q => Math.hypot(q[0] - c.x - 0.5, q[1] - c.y - 0.5))) : 6;
-        const onLine = main.lines.some(l => segDist(c.x + 0.5, c.y + 0.5, l) < 0.7) ? 1 : 0;
-        return Math.min(gap, 6) / 6 - onLine + rand() * 0.3;
+    const spareSpots = [];
+    while (main.route.length + spareSpots.length < usable) {
+      const best = pick(s => {
+        const gap = flags.length ? Math.min(...flags.map(q => dist2(q, s.pt))) : 6;
+        const onLine = main.lines.some(l => segDist(s.pt[0], s.pt[1], l) < 0.7) ? 1 : 0;
+        return Math.min(gap, 6) / 6 - onLine + 0.5 * kindPref(s.kind, tP) + rand() * 0.3;
       });
       if (!best) break;
-      Object.assign(best, chooseCorner(best, main.route));
-      usedPosts.add(best.post.join());
-      flags.push(best.pt);
-      spareCells.push(best);
-      taken.add(best.id);
+      hang(best);
+      hungSids.add(best.sid);
+      spareSpots.push(best);
     }
 
     // 4. Other dummies never share a post, and sit nearer the controls as the hardest
     //    course's level rises (about 6 squares away at level 1, 2 at level 5).
-    const usableCells = [...main.route, ...spareCells];
+    const usableSpots = [...main.route, ...spareSpots];
     const target = 6 - 4 * tP;
-    const fromControl = usableCells.map(c => bfs(g, c.id).dist);
-    while (dummyCells.length < dummies) {
-      const cornerFor = new Map();
-      const best = pick((c, strict) => {
-        // Nearest usable control square, and how far it really is by path.
-        let mnCell = Infinity, pd = 0;
-        usableCells.forEach((p, k) => {
-          const d = manh([p.x, p.y], [c.x, c.y]);
-          if (d < mnCell) { mnCell = d; pd = fromControl[k][c.id]; }
-        });
-        if (strict && mnCell < 2 && pd < 3) return null;   // never an open neighbour of a control
-        let bestS = null;
-        for (const k of CORNERS) {
-          const f = flagAt(c, k);
-          if (usedPosts.has(f.post.join()) || (strict && !clearOf(f.pt))) continue;
-          const mn = usableCells.length ? Math.min(...usableCells.map(p => Math.hypot(p.pt[0] - f.pt[0], p.pt[1] - f.pt[1]))) : target;
-          const s = 1 - clamp(Math.abs(mn - target) / 4, 0, 1) + rand() * 0.3;
-          if (bestS === null || s > bestS) { bestS = s; cornerFor.set(c.id, f); }
-        }
-        return bestS;
+    const fromControl = new Map(usableSpots.map(c => [c.sid, bfs(g, c.id).dist]));
+    while (dummySpots.length < dummies) {
+      const best = pick((s, strict) => {
+        let near = null, mn = Infinity;
+        for (const c of usableSpots) { const d = dist2(c.pt, s.pt); if (d < mn) { mn = d; near = c; } }
+        // Never an easy step from a control: close by, with no tape to go round.
+        if (strict && near && mn < 1.5 && fromControl.get(near.sid)[s.id] < 3) return null;
+        return 1 - clamp(Math.abs((near ? mn : target) - target) / 4, 0, 1) + 0.5 * kindPref(s.kind, tP) + rand() * 0.3;
       });
       if (!best) break;
-      Object.assign(best, cornerFor.get(best.id));
-      usedPosts.add(best.post.join());
-      flags.push(best.pt);
-      dummyCells.push(best);
-      taken.add(best.id);
+      hang(best);
+      hungSids.add(best.sid);
+      dummySpots.push(best);
     }
 
     // 5. Every other course picks from the usable controls.
     const routes = defs.map((d, i) => {
       if (i === primary) return main.route;
-      const pool = usableCells.filter(c => d.difficulty >= 3 || c.id !== trapControl);
+      const pool = usableSpots.filter(s => d.difficulty >= 3 || s.sid !== trapControl);
       return planRoute(levelT(d.difficulty), Math.min(sizeFor(d.difficulty), pool.length), pool).route;
     });
 
     // Codes are dealt at random across every hung flag.
-    const hung = [...usableCells, ...dummyCells];
+    const hung = [...usableSpots, ...dummySpots];
     const codes = shuffle(hung.map((_, k) => (o.firstCode | 0) + k), rand);
-    const index = new Map(hung.map((c, k) => [c.id, k]));
-    m.controls = hung.map((c, k) => ({
-      x: c.x, y: c.y, post: c.post, pt: c.pt, code: codes[k],
-      dummy: k >= usableCells.length, trap: !!c.trap,
+    const index = new Map(hung.map((s, k) => [s.sid, k]));
+    m.controls = hung.map((s, k) => ({
+      x: s.x, y: s.y, post: s.post, pt: s.pt, kind: s.kind, code: codes[k],
+      dummy: k >= usableSpots.length, trap: !!s.trap,
     }));
     m.courses = defs.map((d, i) => {
-      const course = { name: d.name, difficulty: d.difficulty, stops: routes[i].map(c => index.get(c.id)) };
+      const course = { name: d.name, difficulty: d.difficulty, stops: routes[i].map(s => index.get(s.sid)) };
       course.legs = legStats(m, g, course);
       return course;
     });
@@ -561,11 +547,12 @@
     if (count !== cw * ch) problems.push(`${cw * ch - count} cells unreachable from start`);
 
     const all = m.controls;
-    if (new Set(all.map(c => c.x + ',' + c.y)).size !== all.length) problems.push('two controls share a square');
-    if (all.some(c => c.x < 0 || c.x >= cw || c.y < 0 || c.y >= ch)) problems.push('control outside maze');
-    if (all.some(c => !c.post || (c.post[0] !== c.x && c.post[0] !== c.x + 1) || (c.post[1] !== c.y && c.post[1] !== c.y + 1) ||
-                      !(c.pt[0] > c.x && c.pt[0] < c.x + 1 && c.pt[1] > c.y && c.pt[1] < c.y + 1)))
-      problems.push('control not beside a corner post of its square');
+    if (all.some(c => !(c.pt[0] > 0 && c.pt[0] < cw && c.pt[1] > 0 && c.pt[1] < ch))) problems.push('control outside maze');
+    // Every flag at a real tape feature of its post: a corner, a tape end, or beside a straight run.
+    for (const c of all) {
+      const ok = spotsAt(m, c.post[0], c.post[1]).some(s => s.kind === c.kind && s.pt[0] === c.pt[0] && s.pt[1] === c.pt[1] && s.x === c.x && s.y === c.y);
+      if (!ok) { problems.push(`control ${c.code} is not at a corner, tape end or beside tape`); break; }
+    }
     const nonTrapPosts = all.filter(c => !c.trap).map(c => c.post.join());
     if (new Set(nonTrapPosts).size !== nonTrapPosts.length) problems.push('two controls share a post');
     const codes = all.map(c => c.code).sort((a, b) => a - b);
@@ -578,11 +565,9 @@
     for (const d of traps) {
       const k = all.findIndex(c => !c.dummy && c.post.join() === d.post.join());
       const c = all[k];
-      const [px, py] = d.post;
-      const arms = [py > 0 && vw[py - 1][px], py < ch && vw[py][px], px > 0 && hw[py][px - 1], px < cw && hw[py][px]];
-      const tapeCorner = arms.filter(Boolean).length === 2 && (arms[0] || arms[1]) && (arms[2] || arms[3]);
-      const diagonal = c.x + d.x === 2 * px - 1 && c.y + d.y === 2 * py - 1;
-      if (!tapeCorner || !diagonal || !d.trap) problems.push('trap dummy is not across a tape corner from its control');
+      const pair = [c.kind, d.kind].sort().join();
+      const opposite = c.pt[0] + d.pt[0] === 2 * d.post[0] && c.pt[1] + d.pt[1] === 2 * d.post[1];
+      if (pair !== 'inside,outside' || !opposite || !d.trap) problems.push('trap dummy is not across a tape corner from its control');
       if (m.courses.some(co => co.difficulty < 3 && co.stops.includes(k))) problems.push('a course below level 3 uses the trapped control');
     }
 
@@ -603,7 +588,10 @@
   }
   const postLabel = (m, x, y) => colName(x) + (m.height - y);
   // Which side of its post a control hangs, as a compass point (map top = north).
-  const sideOfPost = c => (c.post[1] === c.y ? 'S' : 'N') + (c.post[0] === c.x ? 'E' : 'W');
+  const sideOfPost = c => {
+    const dx = c.pt[0] - c.post[0], dy = c.pt[1] - c.post[1];
+    return (dy < 0 ? 'N' : dy > 0 ? 'S' : '') + (dx > 0 ? 'E' : dx < 0 ? 'W' : '');
+  };
 
   // What each hung flag is for: the courses that visit it, or dummy / unused.
   function controlUse(m, k) {
@@ -653,7 +641,7 @@
       finish: gapText(m.finishGap),
       gaps: m.extraGaps.map(gapText),
       // Every flag to hang, in code order.
-      controls: m.controls.map((c, k) => ({ code: c.code, post: label(c.post[0], c.post[1]), side: sideOfPost(c), use: controlUse(m, k) }))
+      controls: m.controls.map((c, k) => ({ code: c.code, post: label(c.post[0], c.post[1]), side: sideOfPost(c), feature: KINDS[c.kind], use: controlUse(m, k) }))
         .sort((a, b) => a.code - b.code),
     };
   }
@@ -697,8 +685,7 @@
     for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) out.push(`<circle cx="${px(x)}" cy="${py(y)}" r="3"/>`);
     out.push(`</g>`);
 
-    // Circles centre on the flag point, a quarter square in from the post, so the
-    // post sits just on the circle's edge.
+    // Circles centre on the flag point, a quarter square from its post.
     const R = U * 0.36;
     const master = o.course == null;
     const course = master ? null : m.courses[o.course];
@@ -714,7 +701,8 @@
         out.push(`</g>`);
         for (const c of rest) {
           // Code just inside the circle, on the side away from the post.
-          const lx = px((c.pt[0] + c.x + 0.5) / 2), ly = py((c.pt[1] + c.y + 0.5) / 2) + 4;
+          const ox = c.pt[0] - c.post[0], oy = c.pt[1] - c.post[1], ol = Math.hypot(ox, oy);
+          const lx = px(c.pt[0] + 0.12 * ox / ol), ly = py(c.pt[1] + 0.12 * oy / ol) + 4;
           out.push(haloText(f(lx), f(ly), c.code, `fill="#6f7672" font-size="12" font-weight="700" text-anchor="middle"`, 3));
         }
       }
