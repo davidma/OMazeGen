@@ -2,6 +2,10 @@
 (function () {
   const $ = id => document.getElementById(id);
   const STORE = 'omaze-settings-v2';
+  const SPACING = 2;   // default metres between posts, for tape lengths and the squareness check
+  // Course keys are 1, 2, 3… in the order courses were added, so the same course list
+  // and seed always give the same routes, and removing one course leaves the rest alone.
+  const newKey = () => 1 + Math.max(0, ...courses.map(c => c.key || 0));
   const LEVELS = { 1: 'easy', 2: 'fairly easy', 3: 'moderate', 4: 'hard', 5: 'difficult' };
   const FIELDS = ['w', 'h', 'spacing', 'controls', 'dummies', 'firstCode', 'easiestShare', 'loops', 'minShortcut',
                   'extraGaps', 'branchiness', 'seed', 'event', 'lines', 'codes', 'extras', 'coords'];
@@ -10,7 +14,7 @@
   const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
   const randomSeed = () => String(Math.floor(Math.random() * 1e9));
 
-  let courses = OMaze.DEFAULTS.courses.map(c => ({ ...c }));
+  let courses = OMaze.DEFAULTS.courses.map((c, i) => ({ ...c, key: i + 1 }));
   let view = 0;        // index of the course shown on the Map tab, or 'master'
   let current = null;  // latest generated maze
 
@@ -28,6 +32,7 @@
     }
     if (Array.isArray(saved.courses) && saved.courses.length) courses = saved.courses;
     if (query.has('courses')) courses = query.get('courses').split(',').map((d, i) => ({ name: `Course ${i + 1}`, difficulty: +d }));
+    courses.forEach(c => { if (!c.key) c.key = newKey(); });
     if (!$('seed').value) $('seed').value = randomSeed();
   }
   function save() {
@@ -41,7 +46,7 @@
     return {
       w: clampInt(get('w'), 3, 60, 11),
       h: clampInt(get('h'), 3, 60, 9),
-      spacing: Math.max(0.5, +get('spacing') || 2),
+      spacing: Math.max(0.5, +get('spacing') || SPACING),
       controls: clampInt(get('controls'), 0, 200, 14),
       dummies: clampInt(get('dummies'), 0, 200, 2),
       firstCode: clampInt(get('firstCode'), 1, 999, 201),
@@ -68,9 +73,11 @@
         <select id="course-level-${i}" aria-label="Course ${i + 1} difficulty">
           ${[1, 2, 3, 4, 5].map(l => `<option value="${l}"${l === +c.difficulty ? ' selected' : ''}>Level ${l}</option>`).join('')}
         </select>
-        <button type="button" class="remove" aria-label="Remove ${esc(c.name)}"${courses.length === 1 ? ' disabled' : ''}>×</button>`;
+        <button type="button" class="icon reroll" aria-label="New route for ${esc(c.name)}" title="New route for this course">↻</button>
+        <button type="button" class="icon remove" aria-label="Remove ${esc(c.name)}" title="Remove this course"${courses.length === 1 ? ' disabled' : ''}>×</button>`;
       row.querySelector('input').addEventListener('change', e => { c.name = e.target.value.trim() || `Course ${i + 1}`; run(); });
       row.querySelector('select').addEventListener('change', e => { c.difficulty = +e.target.value; run(); });
+      row.querySelector('.reroll').addEventListener('click', () => { c.variant = (c.variant || 0) + 1; view = i; run(); });
       row.querySelector('.remove').addEventListener('click', () => {
         courses.splice(i, 1);
         if (view !== 'master' && view >= courses.length) view = courses.length - 1;
@@ -82,7 +89,7 @@
   }
   $('add-course').addEventListener('click', () => {
     const last = courses[courses.length - 1];
-    courses.push({ name: `Course ${courses.length + 1}`, difficulty: last ? last.difficulty : 3 });
+    courses.push({ name: `Course ${courses.length + 1}`, difficulty: last ? last.difficulty : 3, key: newKey() });
     renderCourseList();
     run();
   });
@@ -109,8 +116,7 @@
     const hint = [];
     if (m.controls.length < s.controls) hint.push(`This maze has room for ${m.controls.length} controls.`);
     if (s.dummies >= s.controls && s.controls > 0) hint.push('At least one control must be usable on a course.');
-    if (m.controls.length) hint.push(`Codes ${s.firstCode}–${s.firstCode + m.controls.length - 1}.`);
-    hint.push('Dummies are hung but never on a course.');
+    if (m.controls.length) hint.unshift(`Codes ${s.firstCode}–${s.firstCode + m.controls.length - 1}.`);
     $('controls-hint').textContent = hint.join(' ');
     const perLevel = [1, 2, 3, 4, 5].map(L => usable ? Math.min(usable, Math.max(1, Math.round(usable * (s.easiestShare + (1 - s.easiestShare) * (L - 1) / 4)))) : 0);
     $('share-hint').textContent = usable ? `Levels 1 to 5 visit ${perLevel.join(', ')} of the ${usable} usable controls. All courses share the same flags.` : '';
@@ -119,7 +125,6 @@
     $('problems').textContent = problems.length ? 'Rule check failed: ' + problems.join('; ') : '';
 
     const sheet = OMaze.buildSheet(m);
-    renderStats(m, sheet, s);
     renderViews(m);
     renderMap(m, s);
     renderCourses(m, s);
@@ -131,16 +136,6 @@
   const hasChoice = l => l.alt !== Infinity && l.alt <= l.length * 1.3;
   const stopName = (m, co, i) => i === 0 ? 'Start' : i > co.stops.length ? 'Finish' : `${i}-${m.controls[co.stops[i - 1]].code}`;
   const choiceText = l => l.alt === Infinity ? 'One route' : l.alt === l.length ? 'Two equal routes' : `Alternative +${l.alt - l.length}`;
-
-  function renderStats(m, sheet, s) {
-    const dummies = m.controls.filter(c => c.dummy).length;
-    $('stats').innerHTML = `
-      <div><dt>Posts</dt><dd>${sheet.posts}</dd></div>
-      <div><dt>Squares</dt><dd>${(m.width - 1) * (m.height - 1)}<small>${fmt((m.width - 1) * s.spacing)} × ${fmt((m.height - 1) * s.spacing)} m</small></dd></div>
-      <div><dt>Tape</dt><dd>${sheet.segments}<small>segments, ${fmt(sheet.segments * s.spacing)} m</small></dd></div>
-      <div><dt>Controls hung</dt><dd>${m.controls.length}${dummies ? `<small>incl. ${dummies} dummies</small>` : ''}</dd></div>
-      <div><dt>Courses</dt><dd>${m.courses.length}</dd></div>`;
-  }
 
   function renderViews(m) {
     if (view !== 'master' && view >= m.courses.length) view = 0;
@@ -194,42 +189,53 @@
     }).join('');
   }
 
-  const runList = runs => runs.map(r => `${r.from}–${r.to}`).join(', ') || '—';
-  const runTotal = runs => runs.reduce((t, r) => t + r.n, 0);
+  // The setting-out procedure as plain text, shared by the page and the master PDF:
+  // lay out the posts, lay the tape piece by piece, then hang the controls.
+  function setOut(m, sheet, s) {
+    const lastCol = OMaze.colName(m.width - 1);
+    const [a1, top, a10, l1] = sheet.corners;
+    const diag = Math.hypot((m.width - 1) * s.spacing, (m.height - 1) * s.spacing);
+    const doubled = sheet.pieces.reduce((t, p) => t + p.doubled, 0);
+    const len = p => fmt(p.segments * s.spacing);
+    const openings = [`start ${sheet.start}`, `finish ${sheet.finish}`, ...sheet.gaps].join(', ');
+    return {
+      posts: `Put in ${sheet.posts} posts in a ${m.width} × ${m.height} grid, ${s.spacing} m apart: columns A–${lastCol} ` +
+        `from west to east, rows 1–${m.height} from the start side. The grid is ${fmt((m.width - 1) * s.spacing)} × ` +
+        `${fmt((m.height - 1) * s.spacing)} m. Check it is square before taping: both diagonals, ${a1} to ${top} and ` +
+        `${a10} to ${l1}, should measure ${fmt(diag)} m.`,
+      tape: `${sheet.pieces.length} pieces of tape, ${fmt(sheet.tapeSegments * s.spacing)} m in all` +
+        (sheet.pieces.length ? `, longest ${len(sheet.pieces[0])} m` : '') +
+        (doubled ? `. ${fmt(doubled * s.spacing)} m of that doubles back on short out-and-back spurs, to keep the pieces long` : '') +
+        `. Tie each piece round its first post, wrap it round every post it passes, and tie off at the last. ` +
+        `Leave the openings untaped: ${openings}.`,
+      pieces: sheet.pieces.map((p, i) => ({
+        title: `Piece ${i + 1}`,
+        length: `${len(p)} m`,
+        route: `Start at ${p.start}, ${p.steps.join(', ')}, tie off ${p.end.startsWith('back') ? p.end : 'at ' + p.end}.` +
+          (p.doubled ? ` Doubles back over ${p.doubled} segment${p.doubled > 1 ? 's' : ''}.` : ''),
+      })),
+      controls: 'Hang each flag where the master map shows it. Every flag is marked there with its code.',
+    };
+  }
 
   function renderSheet(m, sheet, s) {
-    const table = (title, dir, groups) => `
-      <div>
-        <h3>${title}</h3>
-        <div class="runs-wrap"><table class="runs">
-          <thead><tr><th>${dir}</th><th>Tape runs</th><th>Segments</th></tr></thead>
-          <tbody>${groups.map(g => `<tr><td>${g.name}</td><td class="list">${runList(g.runs)}</td><td class="num">${runTotal(g.runs)}</td></tr>`).join('')}</tbody>
-        </table></div>
-      </div>`;
-    const flags = sheet.controls.length ? `
-      <div>
-        <h3>Controls to hang</h3>
-        <div class="runs-wrap"><table class="runs">
-          <thead><tr><th>Code</th><th>Post</th><th>Side</th><th>Feature</th><th>Use</th></tr></thead>
-          <tbody>${sheet.controls.map(c => `<tr><td>${c.code}</td><td class="list">${c.post}</td><td class="list">${c.side}</td><td>${c.feature}</td><td>${esc(c.use)}</td></tr>`).join('')}</tbody>
-        </table></div>
-      </div>` : '';
+    const so = setOut(m, sheet, s);
     $('sheet').innerHTML = `
       <div>
-        <h3>Layout</h3>
-        <dl class="facts">
-          <dt>Grid</dt><dd>${m.width} × ${m.height} posts, columns A–${OMaze.colName(m.width - 1)}, rows 1–${m.height} from the start side</dd>
-          <dt>Posts</dt><dd>${sheet.posts}, ${s.spacing} m apart</dd>
-          <dt>Tape</dt><dd>${sheet.segments} segments (${fmt(sheet.segments * s.spacing)} m)</dd>
-          <dt>Start entrance</dt><dd>${sheet.start} (row 1)</dd>
-          <dt>Finish exit</dt><dd>${sheet.finish} (row ${m.height})</dd>
-          <dt>Other openings</dt><dd>${sheet.gaps.join(', ') || 'none'}</dd>
-        </dl>
+        <h3>1. Lay out the posts</h3>
+        <p class="step">${so.posts}</p>
       </div>
-      ${flags}
-      <div class="sheet-cols">
-        ${table('Across (by row)', 'Row', sheet.rows)}
-        ${table('Up (by column)', 'Col', sheet.cols)}
+      <div>
+        <h3>2. Lay the tape</h3>
+        <p class="step">${so.tape}</p>
+        <div class="runs-wrap"><table class="runs pieces">
+          <thead><tr><th>Piece</th><th>Length</th><th>Route</th></tr></thead>
+          <tbody>${so.pieces.map((p, i) => `<tr><td>${i + 1}</td><td class="num">${p.length}</td><td>${p.route}</td></tr>`).join('')}</tbody>
+        </table></div>
+      </div>
+      <div>
+        <h3>3. Hang the controls</h3>
+        <p class="step">${so.controls}</p>
       </div>`;
   }
 
@@ -324,8 +330,10 @@
       st.y += 4.5;
     };
     if (st.y + 20 > H - MARGIN) { doc.addPage('a4', 'portrait'); st.y = MARGIN + 6; }
-    doc.setFont('helvetica', 'bold').setFontSize(13).setTextColor(26, 31, 28).text(title, MARGIN, st.y);
-    st.y += 7;
+    if (title) {
+      doc.setFont('helvetica', 'bold').setFontSize(13).setTextColor(26, 31, 28).text(title, MARGIN, st.y);
+      st.y += 7;
+    }
     header();
     for (const r of rows) {
       doc.setFont('helvetica', 'normal').setFontSize(9);
@@ -340,7 +348,24 @@
     st.y += 6;
   }
 
-  // Master map (every flag with its code), then the setting-out tables.
+  // Wrapped paragraph that flows onto new portrait pages.
+  function paragraph(doc, st, text, size = 10) {
+    const W = doc.internal.pageSize.getWidth(), H = doc.internal.pageSize.getHeight();
+    doc.setFont('helvetica', 'normal').setFontSize(size).setTextColor(26, 31, 28);
+    for (const line of doc.splitTextToSize(text, W - 2 * MARGIN)) {
+      if (st.y > H - MARGIN) { doc.addPage('a4', 'portrait'); st.y = MARGIN + 6; }
+      doc.text(line, MARGIN, st.y);
+      st.y += size * 0.45;
+    }
+    st.y += 4;
+  }
+  function heading(doc, st, text) {
+    if (st.y + 20 > doc.internal.pageSize.getHeight() - MARGIN) { doc.addPage('a4', 'portrait'); st.y = MARGIN + 6; }
+    doc.setFont('helvetica', 'bold').setFontSize(13).setTextColor(26, 31, 28).text(text, MARGIN, st.y);
+    st.y += 7;
+  }
+
+  // Master map (every flag with its code), then the setting-out procedure.
   async function masterPdf(m, s) {
     const svg = OMaze.renderSvg(m, { course: null, coords: true });
     const doc = addPage(null, svg);
@@ -352,15 +377,18 @@
     doc.setFont('helvetica', 'normal').setFontSize(8).setTextColor(122, 131, 126).text(footnote(m, s), MARGIN, H - MARGIN + 2);
 
     const sheet = OMaze.buildSheet(m);
+    const so = setOut(m, sheet, s);
     doc.addPage('a4', 'portrait');
     const st = { y: pageHeader(doc, s.event, 'Setting out',
-      `Start entrance ${sheet.start} · finish exit ${sheet.finish} · other openings ${sheet.gaps.join(', ') || 'none'}`) + 2 };
-    textTable(doc, st, 'Controls to hang', [{ head: 'Code', w: 14 }, { head: 'Post', w: 16 }, { head: 'Side', w: 12 }, { head: 'Feature', w: 30 }, { head: 'Use', w: 0 }],
-      sheet.controls.map(c => [c.code, c.post, c.side, c.feature, c.use]));
-    textTable(doc, st, 'Tape across, by row', [{ head: 'Row', w: 14 }, { head: 'Segments', w: 20 }, { head: 'Tape runs', w: 0 }],
-      sheet.rows.map(g => [g.name, runTotal(g.runs), runList(g.runs)]));
-    textTable(doc, st, 'Tape up, by column', [{ head: 'Col', w: 14 }, { head: 'Segments', w: 20 }, { head: 'Tape runs', w: 0 }],
-      sheet.cols.map(g => [g.name, runTotal(g.runs), runList(g.runs)]));
+      `${sheet.posts} posts · ${sheet.pieces.length} pieces of tape · ${fmt(sheet.tapeSegments * s.spacing)} m of tape`) + 2 };
+    heading(doc, st, '1. Lay out the posts');
+    paragraph(doc, st, so.posts);
+    heading(doc, st, '2. Lay the tape');
+    paragraph(doc, st, so.tape);
+    textTable(doc, st, '', [{ head: 'Piece', w: 14 }, { head: 'Length', w: 18 }, { head: 'Route', w: 0 }],
+      so.pieces.map((p, i) => [i + 1, p.length, p.route]));
+    heading(doc, st, '3. Hang the controls');
+    paragraph(doc, st, so.controls);
     return doc;
   }
 
@@ -411,7 +439,8 @@
     $(id).value = clampInt(+$(id).value + +d, 3, 60, +$(id).value);
     run();
   }));
-  $('new').addEventListener('click', () => { $('seed').value = randomSeed(); run(); });
+  // A new maze starts every course from its first route again.
+  $('new').addEventListener('click', () => { $('seed').value = randomSeed(); courses.forEach(c => { c.variant = 0; }); run(); });
   FIELDS.forEach(k => {
     const el = $(k);
     el.addEventListener(el.type === 'range' || el.type === 'checkbox' ? 'input' : 'change', k === 'event' ? save : run);

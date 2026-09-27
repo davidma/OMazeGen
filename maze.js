@@ -234,7 +234,6 @@
   //   beside   beside a straight run of tape, square to it, on a side with no tape
   // Tips and beside spots sit on the open line between two squares; the flag is routed
   // through the square to its east or south (west or north at the maze edge).
-  const KINDS = { inside: 'inside corner', outside: 'outside corner', tip: 'end of tape', beside: 'beside tape' };
 
   function spotsAt(m, px, py) {
     const { hw, vw } = m;
@@ -296,7 +295,12 @@
     const usable = total - dummies;
     const share = clamp(+o.easiestShare || 0, 0, 1);
     const defs = (o.courses && o.courses.length ? o.courses : DEFAULTS.courses)
-      .map((c, i) => ({ name: String(c.name || `Course ${i + 1}`), difficulty: clamp(c.difficulty | 0, 1, 5) }));
+      .map((c, i) => ({
+        name: String(c.name || `Course ${i + 1}`),
+        difficulty: clamp(c.difficulty | 0, 1, 5),
+        key: c.key | 0,                          // stable per course, so its route survives edits to others
+        variant: Math.max(0, c.variant | 0),     // bumped to re-roll just this course
+      }));
     const sizeFor = level => usable ? clamp(Math.round(usable * (share + (1 - share) * levelT(level))), 1, usable) : 0;
     const primary = defs.reduce((b, c, i) => (c.difficulty > defs[b].difficulty ? i : b), 0);
     const pLevel = defs[primary].difficulty, tP = levelT(pLevel);
@@ -359,7 +363,7 @@
 
     // Plan one course of n controls at difficulty t. With no pool it hangs new flags
     // at free spots; with a pool it picks from flags already hung.
-    function planRoute(t, n, pool) {
+    function planRoute(t, n, pool, rng = rand) {
       const lo = Math.max(2, Math.round(span * (0.25 + 0.2 * t)));
       const hi = Math.max(lo + 2, Math.round(span * (0.55 + 0.75 * t)));
       const route = [], lines = [], chosen = new Set(), chosenCells = new Set();
@@ -382,7 +386,7 @@
         if (!cand.length) cand = source.filter(fallback);
         if (!cand.length) break;
         let best = null, bestScore = -Infinity;
-        for (const c of shuffle(cand, rand).slice(0, 40)) {
+        for (const c of shuffle(cand, rng).slice(0, 40)) {
           const d = Math.max(1, base.dist[c.id]);
           const deception = clamp((d / Math.max(1, Math.abs(here[0] - c.x) + Math.abs(here[1] - c.y)) - 1) / 2, 0, 1);
           const ratio = alternative(g, cur, c.id, base) / d;
@@ -394,7 +398,7 @@
           s -= clutter(lines, curPt, c.pt, prevPt, others);
           if (i === n - 1) s -= clutter(lines, c.pt, finishPt, curPt, placedPts);            // closing leg to the finish
           if (wantTrap && partnerFree(c)) s += 0.6;
-          s += rand() * 0.4;
+          s += rng() * 0.4;
           if (s > bestScore) { bestScore = s; best = c; }
         }
         if (!pool) { hang(best); hungSids.add(best.sid); }
@@ -477,11 +481,16 @@
       dummySpots.push(best);
     }
 
-    // 5. Every other course picks from the usable controls.
+    // 5. Every other course picks from the usable controls. Each course has its own
+    //    random stream (from the seed, its key and its variant), so re-rolling one
+    //    course leaves the others alone. The hardest course keeps the route that hung
+    //    the flags until it is re-rolled; then it too picks from the hung flags.
     const routes = defs.map((d, i) => {
-      if (i === primary) return main.route;
+      if (i === primary && !d.variant) return main.route;
+      const key = d.key || i + 1;   // courses without a key fall back to their position
+      const rng = mulberry32(m.seed ^ Math.imul(key, 0x9e3779b1) ^ Math.imul(d.variant + 1, 0x85ebca77));
       const pool = usableSpots.filter(s => d.difficulty >= 3 || s.sid !== trapControl);
-      return planRoute(levelT(d.difficulty), Math.min(sizeFor(d.difficulty), pool.length), pool).route;
+      return planRoute(levelT(d.difficulty), Math.min(sizeFor(d.difficulty), pool.length), pool, rng).route;
     });
 
     // Codes are dealt at random across every hung flag.
@@ -587,64 +596,148 @@
     return s;
   }
   const postLabel = (m, x, y) => colName(x) + (m.height - y);
-  // Which side of its post a control hangs, as a compass point (map top = north).
-  const sideOfPost = c => {
-    const dx = c.pt[0] - c.post[0], dy = c.pt[1] - c.post[1];
-    return (dy < 0 ? 'N' : dy > 0 ? 'S' : '') + (dx > 0 ? 'E' : dx < 0 ? 'W' : '');
-  };
 
-  // What each hung flag is for: the courses that visit it, or dummy / unused.
-  function controlUse(m, k) {
-    const c = m.controls[k];
-    if (c.dummy) return c.trap ? 'Dummy (outside the corner)' : 'Dummy';
-    const uses = m.courses.map(co => [co.name, co.stops.indexOf(k)]).filter(([, i]) => i >= 0);
-    return uses.length ? uses.map(([name, i]) => `${name} #${i + 1}`).join(', ') : 'Not on any course';
+  // ---- Tape plan ---------------------------------------------------------------
+  // How to lay the tape as few, long continuous pieces, turning at posts, so it can
+  // be reused afterwards. Each connected group of tape is covered by the fewest pieces
+  // possible: one per pair of posts where an odd number of tapes meet (Euler trails,
+  // found by joining those posts to a virtual post). Pieces go straight on at a post
+  // where they can. Then any piece of SHORT_RUN segments or fewer that starts or ends
+  // on another piece is laid as an out-and-back from it instead, doubling that bit of
+  // tape but keeping the longer piece whole.
+  const SHORT_RUN = 2;
+
+  function tapePlan(m) {
+    const { width: W, height: H, hw, vw } = m;
+    const cw = W - 1, ch = H - 1, REAL = W * H;
+    const vid = (x, y) => y * W + x;
+    const xy = v => [v % W, Math.floor(v / W)];
+    const edges = [];
+    for (let y = 0; y < H; y++) for (let x = 0; x < cw; x++) if (hw[y][x]) edges.push([vid(x, y), vid(x + 1, y)]);
+    for (let y = 0; y < ch; y++) for (let x = 0; x < W; x++) if (vw[y][x]) edges.push([vid(x, y), vid(x, y + 1)]);
+    const segments = edges.length;
+    const adj = new Map();
+    const link = (v, e) => { if (!adj.has(v)) adj.set(v, []); adj.get(v).push(e); };
+    edges.forEach(([a, b], e) => { link(a, e); link(b, e); });
+    const other = (e, v) => (edges[e][0] === v ? edges[e][1] : edges[e][0]);
+    const step = (from, to) => { const [ax, ay] = xy(from), [bx, by] = xy(to); return (bx - ax) + ',' + (by - ay); };
+    const used = new Set();
+
+    // Hierholzer's algorithm: prefer carrying straight on, then any real tape, and
+    // the virtual links (which split the circuit into pieces) last.
+    const circuit = start => {
+      const stack = [[start, -1]], out = [];
+      while (stack.length) {
+        const [v, inE] = stack[stack.length - 1];
+        const open = adj.get(v).filter(e => !used.has(e));
+        if (!open.length) { out.push(v); stack.pop(); continue; }
+        const inDir = inE >= 0 && v < REAL && other(inE, v) < REAL ? step(other(inE, v), v) : null;
+        const rank = e => { const u = other(e, v); return u >= REAL || v >= REAL ? 2 : inDir && step(v, u) === inDir ? 0 : 1; };
+        const e = open.reduce((b, c) => (rank(c) < rank(b) ? c : b));
+        used.add(e);
+        stack.push([other(e, v), e]);
+      }
+      return out;
+    };
+
+    const pieces = [];
+    const seen = new Set();
+    let virtual = REAL;
+    for (const v0 of [...adj.keys()]) {
+      if (seen.has(v0)) continue;
+      const comp = [v0];
+      seen.add(v0);
+      for (let i = 0; i < comp.length; i++) for (const e of adj.get(comp[i])) {
+        const u = other(e, comp[i]);
+        if (!seen.has(u)) { seen.add(u); comp.push(u); }
+      }
+      const odd = comp.filter(v => adj.get(v).length % 2);
+      if (!odd.length) { pieces.push(circuit(comp[0])); continue; }   // a closed loop of tape
+      const X = virtual++;
+      for (const v of odd) { edges.push([X, v]); link(X, edges.length - 1); link(v, edges.length - 1); }
+      let cur = [];
+      for (const v of circuit(X)) {
+        if (v === X) { if (cur.length > 1) pieces.push(cur); cur = []; } else cur.push(v);
+      }
+      if (cur.length > 1) pieces.push(cur);
+    }
+
+    // Fold short pieces into longer ones as out-and-backs.
+    const segs = p => p.length - 1;
+    for (let merged = true; merged;) {
+      merged = false;
+      pieces.sort((a, b) => segs(b) - segs(a));
+      for (let i = pieces.length - 1; i >= 0 && !merged; i--) {
+        const t = pieces[i];
+        if (segs(t) > SHORT_RUN) continue;
+        for (const path of [t, [...t].reverse()]) {
+          const host = pieces.find(u => u !== t && segs(u) >= segs(t) && u.includes(path[0]));
+          if (!host) continue;
+          const at = host.indexOf(path[0]);
+          host.splice(at + 1, 0, ...path.slice(1), ...path.slice(0, -1).reverse());
+          pieces.splice(i, 1);
+          merged = true;
+          break;
+        }
+      }
+    }
+    pieces.sort((a, b) => segs(b) - segs(a));
+    return { segments, pieces: pieces.map(p => p.map(xy)) };
   }
 
-  // Tape runs (consecutive segments merged) and flags, for setting out on the ground.
+  // A piece of tape as spoken steps: where to start, each straight leg to the post
+  // where it turns (or doubles back), and where to tie off.
+  function describePiece(m, posts) {
+    const label = p => postLabel(m, p[0], p[1]);
+    const name = (dx, dy) => (dy < 0 ? 'north' : dy > 0 ? 'south' : dx > 0 ? 'east' : 'west');
+    const steps = [];
+    let prev = null;
+    for (let i = 1; i < posts.length; i++) {
+      const dx = posts[i][0] - posts[i - 1][0], dy = posts[i][1] - posts[i - 1][1];
+      const d = dx + ',' + dy;
+      if (steps.length && d === prev) steps[steps.length - 1].to = posts[i];
+      else steps.push({ dir: name(dx, dy), back: prev === -dx + ',' + -dy, to: posts[i] });
+      prev = d;
+    }
+    const closed = posts.length > 2 && posts[0][0] === posts[posts.length - 1][0] && posts[0][1] === posts[posts.length - 1][1];
+    const doubled = (() => {
+      const seen = new Set();
+      let n = 0;
+      for (let i = 1; i < posts.length; i++) {
+        const k = [label(posts[i - 1]), label(posts[i])].sort().join();
+        if (seen.has(k)) n++; else seen.add(k);
+      }
+      return n;
+    })();
+    return {
+      segments: posts.length - 1,
+      doubled,
+      start: label(posts[0]),
+      steps: steps.map(s => `${s.back ? 'back ' : ''}${s.dir} to ${label(s.to)}`),
+      end: closed ? `back at the start, ${label(posts[0])}` : label(posts[posts.length - 1]),
+    };
+  }
+
+  // Everything needed to set the maze out on the ground.
   function buildSheet(m) {
-    const { width: W, height: H, hw, vw } = m;
-    const cw = W - 1, ch = H - 1;
     const label = (x, y) => postLabel(m, x, y);
-    let segments = 0;
-    const rows = [];
-    for (let y = H - 1; y >= 0; y--) {
-      const runs = [];
-      let s = -1;
-      for (let x = 0; x <= cw; x++) {
-        const on = x < cw && hw[y][x];
-        if (on) { segments++; if (s < 0) s = x; }
-        else if (s >= 0) { runs.push({ from: label(s, y), to: label(x, y), n: x - s }); s = -1; }
-      }
-      rows.push({ name: String(H - y), runs });
-    }
-    const cols = [];
-    for (let x = 0; x < W; x++) {
-      const runs = [];
-      let s = -1;   // lower post row of current run
-      for (let k = ch - 1; k >= -1; k--) {
-        const on = k >= 0 && vw[k][x];
-        if (on) { segments++; if (s < 0) s = k + 1; }
-        else if (s >= 0) { runs.push({ from: label(x, s), to: label(x, k + 1), n: s - (k + 1) }); s = -1; }
-      }
-      cols.push({ name: colName(x), runs });
-    }
+    const plan = tapePlan(m);
     const gapText = w => w.h
       ? `${label(w.x, w.y)}–${label(w.x + 1, w.y)}`
       : `${label(w.x, w.y + 1)}–${label(w.x, w.y)}`;
+    const pieces = plan.pieces.map(p => describePiece(m, p));
     return {
-      posts: W * H,
-      segments,
-      rows,
-      cols,
+      posts: m.width * m.height,
+      segments: plan.segments,
+      tapeSegments: pieces.reduce((t, p) => t + p.segments, 0),
+      pieces,
       start: gapText(m.startGap),
       finish: gapText(m.finishGap),
       gaps: m.extraGaps.map(gapText),
-      // Every flag to hang, in code order.
-      controls: m.controls.map((c, k) => ({ code: c.code, post: label(c.post[0], c.post[1]), side: sideOfPost(c), feature: KINDS[c.kind], use: controlUse(m, k) }))
-        .sort((a, b) => a.code - b.code),
+      corners: [label(0, m.height - 1), label(m.width - 1, 0), label(0, 0), label(m.width - 1, m.height - 1)],
     };
   }
+
 
   const OVERPRINT = '#a61fc9';   // ISOM course-overprint purple
   const INK = '#1a1f1c';
@@ -807,5 +900,5 @@
     return lines.join('\n');
   }
 
-  global.OMaze = { generate, validate, renderSvg, buildSheet, iofXml, colName, controlUse, DEFAULTS };
+  global.OMaze = { generate, validate, renderSvg, buildSheet, tapePlan, iofXml, colName, DEFAULTS, SHORT_RUN };
 })(typeof window !== 'undefined' ? window : globalThis);
