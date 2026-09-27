@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>O-Maze Tests</title></head>
+<body>
+<pre id="out">running…</pre>
+<script src="maze.js"></script>
+<script>
+  const out = [];
+  const segD = (p, a, b) => { const dx = b[0] - a[0], dy = b[1] - a[1]; const k = Math.max(0, Math.min(1, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy || 1))); return Math.hypot(p[0] - a[0] - k * dx, p[1] - a[1] - k * dy); };
+
+  // 1. Rules hold across many random mazes, control counts and course lists.
+  let failures = 0, runs = 0, close = 0;
+  for (let seed = 1; seed <= 1200; seed++) {
+    const width = 3 + (seed * 7) % 28, height = 3 + (seed * 13) % 28;
+    const controls = (seed * 7) % 60, dummies = seed % 6;
+    const courses = Array.from({ length: 1 + seed % 4 }, (_, i) => ({ name: `C${i + 1}`, difficulty: 1 + (seed + i * 2) % 5 }));
+    const opts = { width, height, seed, loops: (seed % 5) / 10, extraGaps: seed % 6, branchiness: (seed % 11) / 10,
+                   controls, dummies, courses, firstCode: 31 + seed % 300 };
+    const m = OMaze.generate(opts);
+    const problems = OMaze.validate(m);
+    const wantTotal = Math.min(controls, Math.floor((width - 1) * (height - 1) / 2));
+    if (m.controls.length !== wantTotal && controls > 0) problems.push(`hung ${m.controls.length} of ${wantTotal}`);
+    const usable = m.controls.filter(c => !c.dummy).length;
+    m.courses.forEach(co => {
+      const want = usable ? Math.min(usable, Math.max(1, Math.round(usable * (0.5 + 0.5 * (co.difficulty - 1) / 4)))) : 0;
+      // An easy course may be one short when it must skip the trapped control.
+      if (co.stops.length !== want && !(co.difficulty < 3 && co.stops.length === want - 1)) problems.push(`${co.name} has ${co.stops.length} of ${want}`);
+    });
+    const pts = m.controls;
+    for (let a = 0; a < pts.length; a++) for (let b = a + 1; b < pts.length; b++) {
+      if (pts[a].trap || pts[b].trap) continue;
+      if (Math.hypot(pts[a].pt[0] - pts[b].pt[0], pts[a].pt[1] - pts[b].pt[1]) < 1) close++;
+    }
+    try {
+      OMaze.renderSvg(m, { course: null });
+      m.courses.forEach((_, i) => OMaze.renderSvg(m, { course: i, extras: true, codes: true }));
+      OMaze.buildSheet(m);
+      const xml = OMaze.iofXml(m, { event: 'Test & <event>', spacing: 2 });
+      const doc = new DOMParser().parseFromString(xml, 'application/xml');
+      if (doc.querySelector('parsererror')) problems.push('IOF XML does not parse');
+      if (doc.getElementsByTagName('Course').length !== m.courses.length) problems.push('IOF XML course count wrong');
+    } catch (e) { problems.push(`output threw: ${e.message}`); }
+    runs++;
+    if (problems.length) { failures++; if (failures <= 10) out.push(`FAIL ${JSON.stringify(opts)}: ${problems.join('; ')}`); }
+    if (OMaze.renderSvg(OMaze.generate(opts), { course: null }) !== OMaze.renderSvg(m, { course: null })) { failures++; out.push(`NONDETERMINISTIC seed ${seed}`); }
+  }
+  out.unshift(`${runs} mazes, ${failures} failures, ${close} flag pairs closer than 1 square (cramped fallback)`);
+
+  // 2. Difficulty levels differ in the intended direction (one course per maze, 150 mazes per level).
+  out.push('', 'level  leg  path/straight  dead-end%  choice%  dummy-dist  traps/maze  on-line/course');
+  for (let level = 1; level <= 5; level++) {
+    let legs = 0, len = 0, dec = 0, dead = 0, ctrls = 0, choice = 0, dd = 0, dn = 0, onLine = 0, traps = 0;
+    for (let seed = 1; seed <= 150; seed++) {
+      const m = OMaze.generate({ width: 16, height: 14, seed, controls: 15, dummies: 3, easiestShare: 1, courses: [{ name: 'X', difficulty: level }] });
+      const co = m.courses[0];
+      co.legs.forEach(l => { legs++; len += l.length; dec += l.length / Math.max(1, l.straight); if (l.alt !== Infinity && l.alt <= l.length * 1.3) choice++; });
+      const open = (x, y) => [x > 0 && !m.vw[y][x], x < 14 && !m.vw[y][x + 1], y > 0 && !m.hw[y][x], y < 12 && !m.hw[y + 1][x]].filter(Boolean).length;
+      const cc = co.stops.map(k => m.controls[k]);
+      cc.forEach(c => { ctrls++; if (open(c.x, c.y) === 1) dead++; });
+      const p = [[m.startGap.x + 0.5, 13.5], ...cc.map(c => c.pt), [m.finishGap.x + 0.5, -0.5]];
+      for (let i = 0; i < p.length - 1; i++) p.forEach((q, k) => { if (k !== i && k !== i + 1 && k > 0 && k < p.length - 1 && segD(q, p[i], p[i + 1]) < 0.6) onLine++; });
+      m.controls.filter(c => c.dummy).forEach(d => { dn++; dd += Math.min(...cc.map(c => Math.hypot(c.pt[0] - d.pt[0], c.pt[1] - d.pt[1]))); if (d.trap) traps++; });
+    }
+    out.push(`  ${level}   ${(len / legs).toFixed(1).padStart(4)}      ${(dec / legs).toFixed(2)}         ${(100 * dead / ctrls).toFixed(0).padStart(3)}      ${(100 * choice / legs).toFixed(0).padStart(3)}       ${(dd / dn).toFixed(1)}        ${(traps / 150).toFixed(2)}         ${(onLine / 150).toFixed(2)}`);
+  }
+
+  // 3. Several courses on one maze: shared controls, easy courses avoid the trap.
+  let trapMazes = 0, easyOnTrap = 0, sizes = [0, 0, 0];
+  for (let seed = 1; seed <= 150; seed++) {
+    const m = OMaze.generate({ width: 14, height: 12, seed, controls: 16, dummies: 3 });
+    m.courses.forEach((co, i) => { sizes[i] += co.stops.length; });
+    const trapK = m.controls.findIndex(c => !c.dummy && m.controls.some(d => d.trap && d.post.join() === c.post.join()));
+    if (trapK >= 0) { trapMazes++; if (m.courses.some(co => co.difficulty < 3 && co.stops.includes(trapK))) easyOnTrap++; }
+  }
+  out.push('', `Default 3 courses (levels 1/3/5, 13 usable): average ${sizes.map(s => (s / 150).toFixed(1)).join(' / ')} controls; trap in ${trapMazes}/150 mazes; easy course on trapped control: ${easyOnTrap}`);
+  document.getElementById('out').textContent = out.join('\n');
+</script>
+</body>
+</html>
